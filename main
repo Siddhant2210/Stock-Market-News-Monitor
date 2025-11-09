@@ -1,0 +1,253 @@
+import os, json, csv, re, time, threading
+from datetime import datetime, timedelta
+import feedparser
+import requests
+from newspaper import Article
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+from reportlab.lib.units import inch
+from plyer import notification
+import tkinter as tk
+from tkinter import scrolledtext
+
+# ===== SETTINGS =====
+KEYWORDS = ["stock", "market","finance", "trading",  "IPO", "NSE", "BSE",
+            "jane street", "hedge fund", "venture capital", "cryptocurrency",
+            "citadel", "goldman sachs", "morgan stanley", "banking", "investment",
+            "fund", "economy", "inflation", "recession", "bull market", "bear market","FEMA"]
+REFRESH_INTERVAL = 900  # 15 min
+OUTPUT_DIR = "finance_articles"
+SEEN_FILE = "seen_articles.json"
+LOG_FILE = "news_log.csv"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+week_filter = datetime.now() - timedelta(days=7)
+
+# ===== Top 15 Financial Newspapers =====
+RSS_FEEDS = {
+    "Financial Express": "https://www.financialexpress.com/feed/",
+    "Mint": "https://www.livemint.com/rss/news",
+    "Economic Times": "https://economictimes.indiatimes.com/rssfeedsdefault.cms",
+    "Business Standard": "https://www.business-standard.com/rss",
+    "Hindu Business Line": "https://www.thehindubusinessline.com/feeder/default.rss",
+    "Moneycontrol": "https://www.moneycontrol.com/rss/latestnews.xml",
+    "Business Today": "https://www.businesstoday.in/rss/news.xml",
+    "CNBC TV18": "https://www.cnbctv18.com/rss/market/feed.xml",
+    "Livemint Economy": "https://www.livemint.com/rss/economy",
+    "The Hindu Money": "https://www.thehindu.com/money/feeder/default.rss",
+    "Times of India Business": "https://timesofindia.indiatimes.com/rssfeeds/1898055.cms",
+    "India Today Business": "https://www.indiatoday.in/rss/1206576",
+    "NDTV Profit": "https://www.ndtv.com/rss/ndtvprofit.xml",
+    "Zee Business": "https://www.zeebiz.com/rss/business.xml",
+    "Reuters India": "https://www.reuters.com/rssFeed/indiaNews"
+}
+
+# ===== Load seen articles safely =====
+try:
+    with open(SEEN_FILE, "r") as f:
+        SEEN = set(json.load(f))
+except (FileNotFoundError, json.decoder.JSONDecodeError):
+    print("⚠ seen_articles.json missing or corrupt. Resetting...")
+    SEEN = set()
+
+# ===== Prepare log file =====
+if not os.path.exists(LOG_FILE):
+    with open(LOG_FILE, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Datetime", "Keyword", "Title", "Source", "URL", "PDF_Path"])
+
+# ===== Helper functions =====
+def clean_text(text):
+    junk_patterns = [
+        r"Also Read.*", r"Follow us on.*", r"Click here.*",
+        r"Subscribe to our newsletter.*", r"Download the app.*"
+    ]
+    for pat in junk_patterns:
+        text = re.sub(pat, "", text, flags=re.IGNORECASE)
+    return re.sub(r"\n{2,}", "\n\n", text.strip())
+
+def notify(title, msg):
+    try:
+        notification.notify(title=title, message=msg, timeout=6)
+    except:
+        pass
+
+def log_entry(keyword, title, source, url, pdf_path):
+    with open(LOG_FILE, "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                         keyword, title, source, url, pdf_path])
+
+def batch_to_pdf(articles, batch_filename):
+    doc = SimpleDocTemplate(batch_filename, pagesize=A4,
+                            rightMargin=50, leftMargin=50,
+                            topMargin=50, bottomMargin=40)
+    styles = getSampleStyleSheet()
+    story = []
+    title_style = ParagraphStyle('titleStyle', parent=styles['Heading1'], fontSize=18, textColor=colors.HexColor("#00ff00"), alignment=1, spaceAfter=12)
+    body_style = ParagraphStyle('bodyStyle', parent=styles['Normal'], fontSize=12, leading=18, spaceAfter=8)
+    meta_style = ParagraphStyle('metaStyle', parent=styles['Normal'], textColor=colors.grey, fontSize=10, leading=14)
+    for idx, art in enumerate(articles):
+        story.append(Paragraph(art['title'], title_style))
+        story.append(Spacer(1,0.1*inch))
+        meta_table = Table([
+            ["📅 Date", art['date']],
+            ["📰 Source", art['source']],
+            ["🔑 Keyword", art['keyword']],
+            ["🔗 URL", f'<link href="{art["link"]}" color="blue">{art["link"]}</link>']
+        ], colWidths=[1.2*inch, 4.8*inch])
+        meta_table.setStyle(TableStyle([
+            ('TEXTCOLOR',(0,0),(-1,-1),colors.black),
+            ('FONTNAME',(0,0),(-1,-1),'Helvetica'),
+            ('FONTSIZE',(0,0),(-1,-1),10),
+            ('BOX',(0,0),(-1,-1),0.25,colors.grey),
+            ('GRID',(0,0),(-1,-1),0.25,colors.lightgrey),
+            ('ALIGN',(0,0),(-1,-1),'LEFT')
+        ]))
+        story.append(meta_table)
+        story.append(Spacer(1,0.2*inch))
+        for para in art['content'].split("\n"):
+            story.append(Paragraph(para.strip(), body_style))
+            story.append(Spacer(1,0.1*inch))
+        if idx < len(articles)-1:
+            story.append(PageBreak())
+    doc.build(story)
+
+def process_article(entry, source, articles_batch, gui_display):
+    url = entry.link
+    if url in SEEN:
+        return
+    try:
+        pub_date = datetime.strptime(entry.published, '%Y-%m-%dT%H:%M:%SZ')
+        if pub_date < week_filter:
+            return
+    except:
+        pub_date = datetime.now()
+    try:
+        r = requests.get(url, timeout=5)
+        if r.status_code != 200:
+            return
+        article = Article(url, fetch_images=False)
+        article.download()
+        article.parse()
+        text = clean_text(article.text)
+        text_lower = text.lower()
+        for kw in KEYWORDS:
+            if kw.lower() in text_lower:
+                title = article.title or entry.title
+                art_dict = {
+                    'title': title,
+                    'source': source,
+                    'date': pub_date.strftime("%Y-%m-%d %H:%M:%S"),
+                    'link': url,
+                    'keyword': kw,
+                    'content': text
+                }
+                articles_batch.append(art_dict)
+                gui_display.append(art_dict)
+                SEEN.add(url)
+                print(f"✅ Matched: {title} | Keyword: {kw}")
+                break
+    except Exception as e:
+        print(f"❌ Error processing {url}: {e}")
+
+# ===== Tkinter GUI =====
+root = tk.Tk()
+root.title("📰 Real-Time Finance News Monitor")
+root.geometry("700x650")
+root.configure(bg="#121212")  # Dark theme
+
+# Article list only
+article_listbox = tk.Listbox(root, width=100, bg="#1f1f1f", fg="#ffffff", 
+                             selectbackground="#00ff99", font=("Helvetica", 12), bd=0)
+article_listbox.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+scrollbar = tk.Scrollbar(root, orient="vertical", command=article_listbox.yview, bg="#1f1f1f", 
+                         troughcolor="#333", activebackground="#00ff99")
+scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+article_listbox.config(yscrollcommand=scrollbar.set)
+
+gui_articles_display = []
+
+# ===== UI Update =====
+def update_ui():
+    article_listbox.delete(0, tk.END)
+    for idx, art in enumerate(reversed(gui_articles_display[-50:])):  # last 50 articles
+        article_listbox.insert(tk.END, f"{art['date']} | {art['source']} | {art['title']}")
+    root.after(2000, update_ui)
+
+# ===== Show article in popup =====
+def show_article_popup(event):
+    selection = article_listbox.curselection()
+    if not selection:
+        return
+    idx = len(gui_articles_display) - 1 - selection[0]  # reversed list
+    art = gui_articles_display[idx]
+
+    popup = tk.Toplevel()
+    popup.title(art['title'])
+    popup.geometry("900x700")
+    popup.configure(bg="#121212")
+
+    text_area = scrolledtext.ScrolledText(popup, bg="#252525", fg="#e0e0e0", font=("Helvetica", 12), wrap=tk.WORD)
+    text_area.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+    
+    # Tags styling
+    text_area.tag_config("title", foreground="#00ff99", font=("Helvetica", 16, "bold"), spacing3=8)
+    text_area.tag_config("meta", foreground="#aaaaaa", font=("Helvetica", 11, "italic"))
+    text_area.tag_config("link", foreground="#4da6ff", underline=True)
+    text_area.tag_config("content", foreground="#e0e0e0", font=("Helvetica", 12), spacing2=4)
+
+    # Insert content
+    text_area.insert(tk.END, f"Title: {art['title']}\n", "title")
+    text_area.insert(tk.END, f"Source: {art['source']}\n", "meta")
+    text_area.insert(tk.END, f"Keyword: {art['keyword']}\n", "meta")
+    text_area.insert(tk.END, f"Date: {art['date']}\n", "meta")
+    text_area.insert(tk.END, f"Link: {art['link']}\n\n", "link")
+    text_area.insert(tk.END, art['content'], "content")
+    text_area.config(state=tk.DISABLED)
+
+article_listbox.bind("<<ListboxSelect>>", show_article_popup)
+
+# ===== Terminal Title =====
+print("📰 Real-Time Finance News Monitor")
+print("Starting at:", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+print("="*80)
+
+# ===== Background fetch thread =====
+def background_loop():
+    while True:
+        articles_batch = []
+        for source, feed_url in RSS_FEEDS.items():
+            try:
+                print(f"⏳ Fetching feed: {source}")
+                feed = feedparser.parse(feed_url)
+                for entry in feed.entries:
+                    process_article(entry, source, articles_batch, gui_articles_display)
+            except Exception as e:
+                print(f"❌ Feed fetch error ({source}): {e}")
+
+        if articles_batch:
+            timestamp_name = datetime.now().strftime("%Y%m%d_%H%M") + ".pdf"
+            batch_path = os.path.join(OUTPUT_DIR, timestamp_name)
+            try:
+                batch_to_pdf(articles_batch, batch_path)
+            except Exception as e:
+                print(f"❌ PDF generation error: {e}")
+            for art in articles_batch:
+                log_entry(art['keyword'], art['title'], art['source'], art['link'], batch_path)
+            notify("📈 Batch PDF Created", f"{len(articles_batch)} articles saved in {timestamp_name}")
+            print(f"✅ Batch PDF saved: {batch_path}")
+        else:
+            print("⏳ No new articles this interval.")
+
+        with open(SEEN_FILE, "w") as f:
+            json.dump(list(SEEN), f)
+
+        print(f"⏱ Waiting {REFRESH_INTERVAL/60} minutes for next fetch...\n")
+        time.sleep(REFRESH_INTERVAL)
+
+threading.Thread(target=background_loop, daemon=True).start()
+update_ui()
+root.mainloop()
